@@ -92,3 +92,144 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pickle
+import gzip
+import os
+import json
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import precision_score, balanced_accuracy_score, recall_score, f1_score, confusion_matrix
+
+def clean_data(df):
+    # renombrar columna
+    df = df.rename(columns={"default payment next month": "default"})
+
+    # eliminar columna id
+    df = df.drop(columns="ID")
+
+    # eliminar registros de info no disponible
+    df = df.dropna()
+    df = df[
+        (df["SEX"] != 0) &
+        (df["EDUCATION"] != 0) &
+        (df["MARRIAGE"] != 0)
+    ]
+
+    # agrupar valores mayores a 4 a 4
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+
+    return df
+
+
+def create_pipeline():
+    transformer = ColumnTransformer(
+        transformers=[(
+            "ohe", OneHotEncoder(dtype="int", handle_unknown="ignore"), ["SEX", "EDUCATION", "MARRIAGE"]
+        )],
+        remainder="passthrough"
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            ("transformer", transformer),
+            ("classifier", RandomForestClassifier(random_state=42))
+        ],
+        verbose=False
+    )
+
+    return pipeline
+
+
+# 4. optimizar hiperparametros con VC
+def make_grid_search(estimator, param_grid, cv=10):
+    grid_search = GridSearchCV(
+        estimator=estimator,
+        param_grid=param_grid,
+        scoring="balanced_accuracy",
+        cv=cv,
+        n_jobs=-1,
+    )
+
+    return grid_search
+
+#5. guardar el modelo
+def save_model(estimator):
+    if not os.path.exists("../files/models"):
+        os.makedirs("../files/models")
+    with gzip.open("../files/models/model.pkl.gz", "wb") as f:
+        pickle.dump(estimator, f)
+
+def calc_metrics_precision(y_true, y_pred, dataset_type):
+    return {
+        "type": "metrics",
+        "dataset": dataset_type,
+        "precision": precision_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred)
+    }
+
+def calc_conf_matrix(y_true, y_pred, dataset_type):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_type,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)}
+    }
+
+def save_metrics(metrics):
+    if not os.path.exists("../files/output"):
+        os.makedirs("../files/output")
+
+    with open("../files/output/metrics.json", "w") as f:
+        for m in metrics:
+            f.write(json.dumps(m) + "\n")
+
+# leer los datasets
+train_data = pd.read_csv("../files/input/train_data.csv.zip", compression="zip")
+test_data = pd.read_csv("../files/input/test_data.csv.zip", compression="zip")
+
+# 1. limpieza
+train_data = clean_data(train_data)
+test_data = clean_data(test_data)
+
+# 2. dividir los datasets
+(x_train, y_train) = train_data.drop(columns="default"), train_data["default"]
+(x_test, y_test) = test_data.drop(columns="default"), test_data["default"]
+
+# 3. crear el pipeline
+pipeline = create_pipeline()
+# ajustarlo
+pipeline.fit(x_train, y_train)
+
+# 4. ajustar hiperparametros
+param_grid = {
+    "classifier__n_estimators": [300, 500],
+    "classifier__max_depth": [20, 30],
+    "classifier__min_samples_split": [2, 5],
+    "classifier__min_samples_leaf": [1, 2]
+}
+grid_search = make_grid_search(pipeline, param_grid)
+# ajustar
+grid_search.fit(x_train, y_train)
+save_model(grid_search)
+
+# calcular las metricas
+y_train_pred = grid_search.predict(x_train)
+y_test_pred = grid_search.predict(x_test)
+
+train_metrics = calc_metrics_precision(y_train, y_train_pred, "train")
+test_metrics = calc_metrics_precision(y_test, y_test_pred, "test")
+
+train_cm = calc_conf_matrix(y_train, y_train_pred, "train")
+test_cm = calc_conf_matrix(y_test, y_test_pred, "test")
+
+metrics = [train_metrics, test_metrics, train_cm, test_cm]
+save_metrics(metrics)
